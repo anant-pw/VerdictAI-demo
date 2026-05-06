@@ -343,9 +343,9 @@ st.title("⚖️ VerdictAI — LLM Evaluation Dashboard")
 st.caption("Groq · Cerebras · SambaNova · SQLite · Sentence-Transformers · LangChain")
 
 # ── Tab layout ────────────────────────────────────────────────────────────────
-tab_overview, tab_suites, tab_compare, tab_trends, tab_detail, tab_export = st.tabs([
+tab_overview, tab_suites, tab_compare, tab_trends, tab_detail, tab_export, tab_run = st.tabs([
     "📊 Overview", "🗂 Suite Breakdown", "📋 Multi-Run Compare",
-    "📈 Trends", "🔬 Test Detail", "⬇️ Export"
+    "📈 Trends", "🔬 Test Detail", "⬇️ Export", "▶️ Run Suite"
 ])
 
 
@@ -913,3 +913,231 @@ with tab_export:
                 key=f"export_{suite_name}"
             )
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 7 — RUN SUITE
+# ════════════════════════════════════════════════════════════════════════════
+with tab_run:
+    st.subheader("▶️ Run an Evaluation Suite")
+    st.caption("Runs in-process — results save to DB and appear in dashboard instantly.")
+
+    import sys, os as _os
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+
+    # ── API key inputs ────────────────────────────────────────────────────
+    st.markdown("#### 🔑 API Keys")
+    st.caption("Keys entered here are used only for this run and never stored.")
+
+    col_k1, col_k2 = st.columns(2)
+    with col_k1:
+        groq_key_input = st.text_input("Groq API Key", type="password",
+                                        value=_os.getenv("GROQ_API_KEY", ""),
+                                        placeholder="gsk_...")
+    with col_k2:
+        samba_key_input = st.text_input("SambaNova API Key (optional)", type="password",
+                                         value=_os.getenv("SAMBANOVA_API_KEY", ""),
+                                         placeholder="optional — for multi-judge")
+
+    st.markdown("---")
+
+    # ── Suite selector ────────────────────────────────────────────────────
+    st.markdown("#### 📂 Select Suite")
+
+    _suite_dir = _os.path.join(_root, "tests", "suites")
+    _yaml_files = []
+    if _os.path.isdir(_suite_dir):
+        _yaml_files = sorted([
+            f for f in _os.listdir(_suite_dir)
+            if f.endswith(".yaml") or f.endswith(".yml")
+        ])
+
+    col_s1, col_s2 = st.columns([2, 1])
+    with col_s1:
+        if _yaml_files:
+            selected_suite_file = st.selectbox(
+                "Suite file", _yaml_files,
+                help=f"Files from tests/suites/"
+            )
+            selected_suite_path = _os.path.join(_suite_dir, selected_suite_file)
+        else:
+            st.warning("No YAML files found in tests/suites/")
+            selected_suite_path = None
+
+    with col_s2:
+        use_judge_ui = st.checkbox("Use LLM Judge", value=True,
+                                    help="Uncheck for heuristics-only (faster, no API calls)")
+
+    # Preview suite test count
+    if selected_suite_path and _os.path.exists(selected_suite_path):
+        try:
+            import yaml as _yaml
+            with open(selected_suite_path) as _f:
+                _suite_data = _yaml.safe_load(_f)
+            _cases = _suite_data if isinstance(_suite_data, list) else _suite_data.get("test_cases", [])
+            st.info(f"📋 **{selected_suite_file}** — {len(_cases)} test case(s)")
+            with st.expander("Preview test cases"):
+                for _c in _cases[:5]:
+                    st.markdown(f"- **{_c.get('id','?')}** — `{str(_c.get('input',''))[:80]}...`")
+                if len(_cases) > 5:
+                    st.caption(f"... and {len(_cases)-5} more")
+        except Exception as _e:
+            st.warning(f"Could not parse suite: {_e}")
+
+    st.markdown("---")
+
+    # ── Run button ────────────────────────────────────────────────────────
+    run_btn = st.button("▶️ Run Suite", type="primary",
+                         disabled=(not selected_suite_path or not groq_key_input))
+
+    if not groq_key_input:
+        st.caption("⚠️ Enter a Groq API key to enable the run button.")
+
+    if run_btn and selected_suite_path and groq_key_input:
+        # Inject keys into environment for this process
+        _os.environ["GROQ_API_KEY"] = groq_key_input
+        if samba_key_input:
+            _os.environ["SAMBANOVA_API_KEY"] = samba_key_input
+
+        st.markdown("---")
+        st.markdown("#### 🔄 Live Output")
+
+        progress_bar = st.progress(0, text="Initialising...")
+        status_box   = st.empty()
+        results_log  = st.container()
+
+        try:
+            from runner.loader import load_suite as _load_suite
+            _preview = _load_suite(selected_suite_path)
+            _all_cases = _preview if isinstance(_preview, list) else _preview.get("test_cases", [])
+            _total = len(_all_cases)
+        except Exception as _e:
+            st.error(f"Failed to load suite: {_e}")
+            st.stop()
+
+        # Run case-by-case with live updates
+        import time as _time
+        from runner.runner import run_suite as _run_suite
+        from runner.loader import load_suite as _load_suite
+        from runner.assertions import run_assertions as _run_assertions
+        from runner.groq_model import get_response as _get_response
+        from runner.retry_utils import inter_case_sleep as _sleep
+        from judge.multi_judge import multi_judge_response as _multi_judge
+        from judge.relevance_scorer import get_relevance_score as _relevance
+        from judge.hallucination_detector import detect_hallucination as _hallucination
+        from memory.store import init_db as _init_db, save_result as _save_result
+        from database.models import DatabaseManager as _DBM
+        from runner.runner import _compute_verdict, _print_result
+
+        suite_name_ui = _os.path.basename(selected_suite_path).replace(".yaml", "")
+        db_ui = _DBM()
+        run_id_ui = f"{suite_name_ui}_{int(_time.time())}"
+
+        db_ui.create_run(run_id_ui, {"suite_path": selected_suite_path, "use_judge": use_judge_ui})
+        db_ui.create_test_run(run_id=run_id_ui, suite_name=suite_name_ui)
+        _init_db()
+
+        suite_data = _load_suite(selected_suite_path)
+        cases_ui = suite_data if isinstance(suite_data, list) else suite_data.get("test_cases", [])
+
+        results_ui = []
+        passed_ui = failed_ui = 0
+
+        for _i, _case in enumerate(cases_ui):
+            _tid = f"{_case.get('id','unknown')}_{run_id_ui}"
+            _inp = _case.get("input", "")
+            _exp = _case.get("expected_behavior", "")
+            _thresh = _case.get("judge_threshold", 70)
+            _mode = _case.get("scoring_mode", "full")
+
+            status_box.markdown(f"**Running:** `{_tid}` ({_i+1}/{_total})")
+            progress_bar.progress((_i) / _total, text=f"Test {_i+1}/{_total}")
+
+            try:
+                _t0 = _time.time()
+                _resp, _tokens = _get_response(_inp)
+                _lat = int((_time.time() - _t0) * 1000)
+
+                db_ui.save_llm_call(
+                    test_id=_tid, model=_os.getenv("GROQ_MODEL", "groq/llama3-8b"),
+                    prompt=_inp, response=_resp, latency_ms=_lat,
+                    tokens_input=_tokens["tokens_input"],
+                    tokens_output=_tokens["tokens_output"]
+                )
+
+                _heur = _run_assertions(_resp, _case.get("assertions", []))
+                _heur_pass = all(h["passed"] for h in _heur)
+
+                _judge_r = _rel = _hall = None
+                if _heur_pass and use_judge_ui and _exp:
+                    _judge_r = _multi_judge(_inp, _resp, _exp, _thresh)
+                    if _mode == "full":
+                        _rel = _relevance(_resp, _exp)
+                        _src = _case.get("source_context", _exp)
+                        _hall = _hallucination(_resp, _src)
+
+                _verdict = _compute_verdict(_heur_pass, _heur, _judge_r, _rel, _hall, _mode)
+                _vlabel = _verdict.get("verdict") if isinstance(_verdict, dict) else _verdict
+
+                db_ui.save_test_case(test_id=_tid, run_id=run_id_ui,
+                    test_name=_tid, input_data=_inp, expected_output=_exp,
+                    actual_output=_resp, passed=(_vlabel == "PASS"))
+                db_ui.save_test_result(
+                    run_id=run_id_ui, test_id=_tid, verdict=_vlabel,
+                    score=_judge_r.get("score") if _judge_r else None,
+                    relevance_score=_rel.get("score") if _rel else None,
+                    hallucination_score=_hall.get("score") if _hall else None,
+                    reason=_verdict.get("reason") if isinstance(_verdict, dict) else None,
+                    latency_ms=_lat
+                )
+
+                if _judge_r:
+                    db_ui.save_score(_tid, "judge_score", _judge_r["score"], _judge_r.get("reason"))
+                if _rel:
+                    db_ui.save_score(_tid, "relevance_score", _rel["score"])
+                if _hall:
+                    db_ui.save_score(_tid, "hallucination_score", _hall["score"])
+
+                _save_result(suite_name_ui, {
+                    "id": _tid, "verdict": _verdict,
+                    "judge": _judge_r, "response": _resp, "latency_ms": _lat
+                })
+
+                if _vlabel == "PASS":
+                    passed_ui += 1
+                    results_log.success(f"✅ **{_case.get('id','?')}** — PASS | score={_judge_r.get('score','—') if _judge_r else '—'} | {_lat}ms")
+                else:
+                    failed_ui += 1
+                    _why = _verdict.get("reason","") if isinstance(_verdict, dict) else ""
+                    results_log.error(f"❌ **{_case.get('id','?')}** — FAIL | {_why}")
+
+                results_ui.append({"id": _tid, "verdict": _verdict, "judge": _judge_r})
+
+            except Exception as _ex:
+                failed_ui += 1
+                results_log.error(f"💥 **{_case.get('id','?')}** — ERROR: {_ex}")
+
+            if _i < _total - 1:
+                _sleep(2.0)
+
+        # Finalise
+        db_ui.update_run(run_id_ui, status="completed",
+                          total_tests=_total, passed_tests=passed_ui, failed_tests=failed_ui)
+        db_ui.update_test_run_summary(run_id_ui)
+        db_ui.sync_from_eval_tables(run_id_ui)
+        db_ui.close()
+
+        progress_bar.progress(1.0, text="Done!")
+        status_box.empty()
+
+        _pct = passed_ui / _total * 100 if _total else 0
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", _total)
+        c2.metric("✅ Passed", passed_ui, f"{_pct:.1f}%")
+        c3.metric("❌ Failed", failed_ui, delta_color="inverse")
+
+        st.success(f"Run complete! Run ID: `{run_id_ui}`")
+        st.cache_data.clear()
+        st.info("Switch to the Overview tab to see results.")
