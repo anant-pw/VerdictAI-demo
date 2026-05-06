@@ -1,0 +1,23 @@
+# Core
+pyyaml
+python-dotenv
+
+# LLM Providers
+groq
+langchain
+langchain-groq
+langchain-google-genai
+langchain-openai
+tenacity
+
+# Evaluation
+sentence-transformers
+
+# Dashboard
+streamlit
+plotly
+pandas
+loguru
+
+# Async support
+nest_asyncio

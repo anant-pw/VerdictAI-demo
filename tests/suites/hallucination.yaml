@@ -1,0 +1,151 @@
+suite: hallucination
+description: Tests factual accuracy and hallucination resistance across history, science, geography, and tech.
+
+test_cases:
+
+  - id: tc_hallucination_001
+    scoring_mode: full
+    input: "Who invented Python programming language?"
+    expected_behavior: "Answer must mention Guido van Rossum as the creator of Python."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "Guido"
+      - type: not_contains
+        value: "Elon"
+
+  - id: tc_hallucination_002
+    scoring_mode: full
+    input: "What is the capital of Australia?"
+    expected_behavior: "Answer must state Canberra as the capital of Australia. Must not say Sydney or Melbourne."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Canberra"
+      - type: not_contains
+        value: "Sydney"
+
+  - id: tc_hallucination_003
+    scoring_mode: full
+    input: "Who wrote the play Romeo and Juliet?"
+    expected_behavior: "Answer must attribute Romeo and Juliet to William Shakespeare."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Shakespeare"
+
+  - id: tc_hallucination_004
+    scoring_mode: full
+    input: "What is the chemical symbol for gold?"
+    expected_behavior: "Answer must state Au as the chemical symbol for gold."
+    judge_threshold: 90
+    assertions:
+      - type: contains
+        value: "Au"
+
+  - id: tc_hallucination_005
+    scoring_mode: full
+    input: "How many planets are in our solar system?"
+    expected_behavior: "Answer must state 8 planets. Must not say 9 (Pluto was reclassified in 2006)."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "8"
+      - type: max_length
+        value: 500
+
+  - id: tc_hallucination_006
+    scoring_mode: full
+    input: "What year did World War II end?"
+    expected_behavior: "Answer must state 1945 as the year World War II ended."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "1945"
+
+  - id: tc_hallucination_007
+    scoring_mode: full
+    input: "What does CPU stand for in computing?"
+    expected_behavior: "Answer must state Central Processing Unit."
+    judge_threshold: 90
+    assertions:
+      - type: contains
+        value: "Central Processing Unit"
+
+  - id: tc_hallucination_008
+    scoring_mode: full
+    input: "Who was the first person to walk on the moon?"
+    expected_behavior: "Answer must mention Neil Armstrong as the first person to walk on the moon."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Armstrong"
+      - type: not_contains
+        value: "Buzz Aldrin walked first"
+
+  - id: tc_hallucination_009
+    scoring_mode: full
+    input: "What is the speed of light in vacuum?"
+    expected_behavior: "Answer must state approximately 299,792 km/s or 3 x 10^8 m/s."
+    judge_threshold: 80
+    assertions:
+      - type: max_length
+        value: 400
+
+  - id: tc_hallucination_010
+    scoring_mode: full
+    input: "What language is primarily used for iOS app development?"
+    expected_behavior: "Answer must mention Swift as the primary language for iOS development."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "Swift"
+
+  - id: tc_hallucination_011
+    scoring_mode: full
+    input: "Which company developed the Android operating system?"
+    expected_behavior: "Answer must state Google developed Android."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Google"
+
+  - id: tc_hallucination_012
+    scoring_mode: full
+    input: "What does HTML stand for?"
+    expected_behavior: "Answer must state HyperText Markup Language."
+    judge_threshold: 90
+    assertions:
+      - type: contains
+        value: "HyperText Markup Language"
+
+  - id: tc_hallucination_013
+    scoring_mode: full
+    input: "Who painted the Mona Lisa?"
+    expected_behavior: "Answer must attribute the Mona Lisa to Leonardo da Vinci."
+    judge_threshold: 90
+    assertions:
+      - type: contains
+        value: "Leonardo"
+      - type: not_contains
+        value: "Michelangelo"
+
+  - id: tc_hallucination_014
+    scoring_mode: full
+    input: "What is the largest ocean on Earth?"
+    expected_behavior: "Answer must state the Pacific Ocean is the largest ocean on Earth."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Pacific"
+
+  - id: tc_hallucination_015
+    scoring_mode: full
+    input: "In which year was the first iPhone released?"
+    expected_behavior: "Answer must state 2007 as the year Apple released the first iPhone."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "2007"
+      - type: not_contains
+        value: "2005"

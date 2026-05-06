@@ -1,0 +1,121 @@
+suite: format
+description: >
+  Tests model output format compliance —
+  JSON, bullet points, word limits, structured responses, and markdown .
+  scoring_mode: judge_only — relevance/hallucination skipped (format/behaviour suite )
+
+test_cases:
+
+  - id: format_001_json_output
+    scoring_mode: judge_only
+    input: "Return only a raw JSON object, no code, no explanation. Keys: name, age, city. Values: John, 30, New York."
+    expected_behavior: "Response must be a valid JSON object containing exactly the keys name, age, and city with the correct values."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "John"
+      - type: contains
+        value: "New York"
+      - type: max_length
+        value: 200
+
+  - id: format_002_bullet_points
+    scoring_mode: judge_only
+    input: "List 3 benefits of test automation as bullet points. Use • as the bullet symbol."
+    expected_behavior: "Response must contain exactly 3 bullet points using • symbol. Each point must describe a benefit of test automation."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "•"
+      - type: max_length
+        value: 1000
+
+  - id: format_003_word_limit
+    scoring_mode: judge_only
+    input: "Explain what machine learning is in exactly 2 sentences."
+    expected_behavior: "Response must be exactly 2 sentences. Must define machine learning accurately."
+    judge_threshold: 75
+    assertions:
+      - type: max_length
+        value: 300
+
+  - id: format_004_structured_response
+    scoring_mode: judge_only
+    input: "Give me a book recommendation. Format: Title: <title>, Author: <author>, Reason: <one sentence why>."
+    expected_behavior: "Response must follow the exact format with Title, Author, and Reason fields clearly labeled."
+    judge_threshold: 85
+    assertions:
+      - type: contains
+        value: "Title:"
+      - type: contains
+        value: "Author:"
+      - type: contains
+        value: "Reason:"
+      - type: max_length
+        value: 300
+
+  - id: format_005_numbered_list
+    scoring_mode: judge_only
+    input: "List the top 5 programming languages in 2024 as a numbered list. Format: 1. Language"
+    expected_behavior: "Response must be a numbered list from 1 to 5. Each item must be a programming language name."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "1."
+      - type: contains
+        value: "5."
+      - type: max_length
+        value: 400
+
+  - id: format_006_no_markdown
+    scoring_mode: judge_only
+    input: "Explain what an API is. Reply in plain text only. No markdown, no asterisks, no headers."
+    expected_behavior: "Response must be plain text with no markdown formatting. No **, no #, no bullet symbols."
+    judge_threshold: 75
+    assertions:
+      - type: not_contains
+        value: "**"
+      - type: not_contains
+        value: "##"
+      - type: max_length
+        value: 500
+
+  - id: format_007_csv_output
+    scoring_mode: judge_only
+    input: "Return 3 rows of employee data as CSV. Columns: name, department, salary. Use comma as delimiter. No header row."
+    expected_behavior: "Response must be exactly 3 comma-separated rows with no header. Each row must have 3 fields."
+    judge_threshold: 80
+    assertions:
+      - type: max_length
+        value: 300
+
+  - id: format_008_yes_no_answer
+    scoring_mode: judge_only
+    input: "Answer with only YES or NO — no explanation. Is Python an interpreted language?"
+    expected_behavior: "Response must be only the word YES or NO. No additional text, explanation, or punctuation."
+    judge_threshold: 85
+    assertions:
+      - type: max_length
+        value: 10
+
+  - id: format_009_single_word
+    scoring_mode: judge_only
+    input: "Reply with a single word only. What is the opposite of hot?"
+    expected_behavior: "Response must be a single word. The correct answer is cold or cool."
+    judge_threshold: 80
+    assertions:
+      - type: max_length
+        value: 20
+
+  - id: format_010_table_format
+    scoring_mode: judge_only
+    input: "Create a simple 3-row table comparing Python, Java, and JavaScript. Columns: Language, Typing, Primary Use. Use markdown table format."
+    expected_behavior: "Response must be a markdown table with exactly 3 data rows and 3 columns. Must include headers."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "|"
+      - type: contains
+        value: "Python"
+      - type: max_length
+        value: 600

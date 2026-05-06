@@ -1,0 +1,82 @@
+suite: rag
+description: >
+  Simulates RAG evaluation — tests faithfulness, context relevance,
+  and hallucination resistance using injected context blocks.
+  Context is passed directly in the prompt to simulate retrieved documents.
+
+test_cases:
+
+  - id: rag_001_faithfulness
+    scoring_mode: full
+    input: >
+      Use ONLY the following context to answer the question. Do not use outside knowledge.
+
+      CONTEXT:
+      VerdictAI is an LLM evaluation framework built with Python, LangChain, and Groq.
+      It supports heuristic assertions, LLM-as-judge scoring, SQLite memory, and a Streamlit dashboard.
+      It was built to test AI model outputs in a structured, CI-ready pipeline.
+
+      QUESTION: What database does VerdictAI use for storing results?
+    expected_behavior: "Answer must state SQLite. Must be based only on the provided context. Must not mention any other database not in the context."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "SQLite"
+      - type: max_length
+        value: 400
+
+  - id: rag_002_hallucination_resistance
+    scoring_mode: full
+    input: >
+      Use ONLY the following context to answer the question. Do not use outside knowledge.
+
+      CONTEXT:
+      The Eiffel Tower is located in Paris, France. It was constructed between 1887 and 1889.
+      It stands 330 meters tall and was designed by Gustave Eiffel.
+
+      QUESTION: What is the population of Paris?
+    expected_behavior: "Model must say it cannot answer from the given context since population is not mentioned. Must NOT hallucinate a population figure."
+    judge_threshold: 75
+    assertions:
+      - type: not_contains
+        value: "million"
+      - type: max_length
+        value: 300
+
+  - id: rag_003_context_relevance
+    scoring_mode: full
+    input: >
+      Use ONLY the following context to answer the question. Do not use outside knowledge.
+
+      CONTEXT:
+      Photosynthesis is the process by which green plants convert sunlight into food.
+      Plants absorb carbon dioxide and water, and using sunlight, produce glucose and oxygen.
+
+      QUESTION: How do plants make their food?
+    expected_behavior: "Answer must correctly explain photosynthesis using only the context. Must mention sunlight, carbon dioxide, water, and glucose."
+    judge_threshold: 80
+    assertions:
+      - type: contains
+        value: "sunlight"
+      - type: contains
+        value: "glucose"
+      - type: max_length
+        value: 500
+
+  - id: rag_004_no_outside_knowledge
+    scoring_mode: full
+    input: >
+      Use ONLY the following context to answer the question. Do not use outside knowledge.
+
+      CONTEXT:
+      Acme Corp was founded in 2010. It sells cloud storage solutions.
+      The CEO is Jane Smith. The company is headquartered in Austin, Texas.
+
+      QUESTION: What is the annual revenue of Acme Corp?
+    expected_behavior: "Model must acknowledge that revenue information is not available in the context. Must not fabricate a revenue figure."
+    judge_threshold: 75
+    assertions:
+      - type: not_contains
+        value: "$"
+      - type: max_length
+        value: 600

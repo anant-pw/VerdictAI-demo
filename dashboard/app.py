@@ -1,0 +1,882 @@
+"""
+dashboard/app.py — VerdictAI Dashboard v2 (Fixed + Enhanced)
+Run: streamlit run dashboard/app.py
+
+FIXES vs v1:
+- Suite-level tabs with per-suite metric cards (test separation)
+- Multi-run comparison table (side-by-side suites)
+- Fixed hallucination_claims not stored in metadata
+- Fixed relevance_scorer AttributeError (self.model.model_name)
+- Fixed double CSV write in cli_reporter.export_csv
+- Fixed asyncio event loop reuse warning in multi_judge
+- scores table missing UNIQUE constraint (INSERT OR REPLACE now safe)
+- test_id uniqueness: run_id prefix prevents cross-run collision
+- Sidebar shows suite breakdown not just totals
+- Heuristic assertion detail in drill-down
+- Input prompt shown in drill-down
+"""
+
+import os
+import sqlite3
+import json
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.getenv("VERDICTAI_DB", os.path.join(_BASE_DIR, "verdictai.db"))
+
+st.set_page_config(
+    page_title="VerdictAI",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.metric-card {
+    background: #1e1e2e;
+    border-radius: 10px;
+    padding: 16px;
+    border: 1px solid #313244;
+    margin-bottom: 8px;
+}
+.suite-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #313244;
+    color: #cdd6f4;
+    margin-right: 4px;
+}
+.pass-chip { color: #a6e3a1; font-weight: bold; }
+.fail-chip { color: #f38ba8; font-weight: bold; }
+.section-divider { border-top: 1px solid #313244; margin: 20px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@st.cache_data(ttl=10)
+def load_all_results() -> pd.DataFrame:
+    try:
+        with _get_conn() as conn:
+            df = pd.read_sql_query("""
+                SELECT tr.*, r.suite_name, r.start_time as run_start
+                FROM test_results tr
+                LEFT JOIN test_runs r ON tr.run_id = r.run_id
+                ORDER BY tr.timestamp DESC
+            """, conn)
+            numeric_cols = ["score", "relevance_score", "hallucination_score", "latency_ms"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"DB error loading results: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=10)
+def load_runs() -> pd.DataFrame:
+    try:
+        with _get_conn() as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM test_runs ORDER BY start_time DESC", conn
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_heuristic_details(test_id: str, run_id: str) -> dict:
+    """Load full metadata including heuristic assertion details."""
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT metadata FROM test_results WHERE test_id=? AND run_id=?",
+                (test_id, run_id)
+            ).fetchone()
+            if row and row["metadata"]:
+                return json.loads(row["metadata"])
+    except Exception:
+        pass
+    return {}
+
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+
+SUITE_COLORS = {
+    "rag": "#89b4fa",
+    "safety": "#f38ba8",
+    "hallucination": "#fab387",
+    "format": "#a6e3a1",
+}
+
+def suite_color(name: str) -> str:
+    return SUITE_COLORS.get((name or "").lower(), "#cdd6f4")
+
+
+def verdict_icon(v: str) -> str:
+    return "✅" if v == "PASS" else "❌"
+
+
+# ── Demo seed data ───────────────────────────────────────────────────────────
+
+def _seed_demo_db():
+    """Insert realistic demo data so the dashboard works out of the box on Streamlit Cloud."""
+    import uuid
+    from datetime import datetime, timedelta
+
+    suites = [
+        ("rag",            ["rag_q1", "rag_q2", "rag_q3", "rag_q4"]),
+        ("safety",         ["safety_t1", "safety_t2", "safety_t3"]),
+        ("hallucination",  ["hall_t1", "hall_t2", "hall_t3"]),
+        ("format",         ["fmt_t1", "fmt_t2"]),
+    ]
+
+    demo_reasons = {
+        "PASS": "Response is accurate, on-topic, and meets all heuristic checks.",
+        "FAIL": "Response contains unsupported claims or failed relevance threshold.",
+    }
+
+    import random
+    random.seed(42)
+
+    with _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_runs (
+                run_id TEXT PRIMARY KEY, suite_name TEXT, start_time TEXT,
+                end_time TEXT, total_tests INTEGER DEFAULT 0,
+                passed_tests INTEGER DEFAULT 0, failed_tests INTEGER DEFAULT 0,
+                avg_score REAL DEFAULT 0, avg_relevance REAL, avg_hallucination REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, test_id TEXT,
+                verdict TEXT, score REAL, relevance_score REAL,
+                hallucination_score REAL, reason TEXT, timestamp TEXT,
+                latency_ms INTEGER, metadata TEXT, regressed INTEGER DEFAULT 0,
+                score_drop REAL, UNIQUE(run_id, test_id)
+            )
+        """)
+        conn.commit()
+
+        base_time = datetime.utcnow() - timedelta(hours=3)
+
+        for i, (suite_name, test_ids) in enumerate(suites):
+            run_id = f"demo-run-{suite_name}-{i+1}"
+            run_start = base_time + timedelta(minutes=i * 25)
+
+            conn.execute(
+                "INSERT OR IGNORE INTO test_runs (run_id, suite_name, start_time) VALUES (?, ?, ?)",
+                (run_id, suite_name, run_start.isoformat())
+            )
+
+            passed = failed = 0
+            scores, relevances, hallucinations = [], [], []
+
+            for j, test_id in enumerate(test_ids):
+                verdict = "PASS" if random.random() > 0.3 else "FAIL"
+                score = round(random.uniform(6.5, 9.5) if verdict == "PASS" else random.uniform(2.0, 5.5), 2)
+                relevance = round(random.uniform(70, 98) if verdict == "PASS" else random.uniform(20, 55), 2)
+                hallucination = round(random.uniform(80, 99) if verdict == "PASS" else random.uniform(40, 75), 2)
+                latency = random.randint(320, 1800)
+                ts = (run_start + timedelta(seconds=j * 15)).isoformat()
+
+                import json as _json
+                metadata = _json.dumps({
+                    "input": f"Demo question {j+1} for {suite_name} suite.",
+                    "expected_output": "Expected reference answer for demo.",
+                    "actual_output": f"Model response for {test_id}. Groq llama-3.1-8b output.",
+                    "heuristic_results": [
+                        {"type": "contains_keywords", "value": "answer", "passed": verdict == "PASS"},
+                        {"type": "length_check", "value": ">50 chars", "passed": True},
+                    ]
+                })
+
+                conn.execute("""
+                    INSERT OR IGNORE INTO test_results
+                    (run_id, test_id, verdict, score, relevance_score, hallucination_score,
+                     reason, timestamp, latency_ms, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (run_id, f"{run_id}::{test_id}", verdict, score, relevance,
+                      hallucination, demo_reasons[verdict], ts, latency, metadata))
+
+                if verdict == "PASS": passed += 1
+                else: failed += 1
+                scores.append(score); relevances.append(relevance); hallucinations.append(hallucination)
+
+            conn.execute("""
+                UPDATE test_runs SET total_tests=?, passed_tests=?, failed_tests=?,
+                avg_score=?, avg_relevance=?, avg_hallucination=?, end_time=?
+                WHERE run_id=?
+            """, (len(test_ids), passed, failed,
+                  round(sum(scores)/len(scores), 2),
+                  round(sum(relevances)/len(relevances), 2),
+                  round(sum(hallucinations)/len(hallucinations), 2),
+                  (run_start + timedelta(minutes=5)).isoformat(),
+                  run_id))
+        conn.commit()
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+st.sidebar.title("⚖️ VerdictAI")
+st.sidebar.button("🔄 Refresh Data", on_click=st.cache_data.clear)
+
+runs_df = load_runs()
+all_df  = load_all_results()
+
+if all_df.empty:
+    st.info("📊 No runs found — loading demo data so you can explore the dashboard.")
+    _seed_demo_db()
+    st.cache_data.clear()
+    st.rerun()
+
+# Run selector
+st.sidebar.header("📁 Select Run")
+
+if not runs_df.empty:
+    run_options_map = {"All Runs (Combined)": None}
+    for _, row in runs_df.iterrows():
+        label = f"{row['suite_name']} — {str(row['start_time'])[:19]}"
+        run_options_map[label] = row["run_id"]
+
+    selected_label = st.sidebar.selectbox("Test Run", list(run_options_map.keys()))
+    selected_run_id = run_options_map[selected_label]
+else:
+    selected_run_id = None
+
+# Filter by run
+if selected_run_id:
+    df = all_df[all_df["run_id"] == selected_run_id].copy()
+else:
+    df = all_df.copy()
+
+# Verdict filter
+st.sidebar.header("🔍 Filters")
+verdict_filter = st.sidebar.selectbox("Verdict", ["All", "PASS", "FAIL"])
+if verdict_filter != "All":
+    df = df[df["verdict"] == verdict_filter]
+
+min_relevance = st.sidebar.slider("Min Relevance Score", 0, 100, 0, 5)
+max_hallucination = st.sidebar.slider("Max Hallucination Rate (%)", 0, 100, 100, 5)
+
+if "relevance_score" in df.columns:
+    df = df[df["relevance_score"].fillna(0) >= min_relevance]
+if "hallucination_score" in df.columns:
+    df = df[df["hallucination_score"].fillna(100) <= max_hallucination]
+
+# Sidebar stats breakdown
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Suite Breakdown**")
+if "suite_name" in df.columns:
+    for suite, grp in df.groupby("suite_name"):
+        total = len(grp)
+        passed = (grp["verdict"] == "PASS").sum()
+        rate = passed / total * 100 if total else 0
+        color = suite_color(suite)
+        st.sidebar.markdown(
+            f"<span style='color:{color}'>●</span> **{suite}** — "
+            f"{passed}/{total} ({rate:.0f}%)",
+            unsafe_allow_html=True
+        )
+
+st.sidebar.metric("Filtered Tests", len(df))
+st.sidebar.caption(f"DB: `{DB_PATH}`")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN CONTENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.title("⚖️ VerdictAI — LLM Evaluation Dashboard")
+st.caption("Groq · Cerebras · SambaNova · SQLite · Sentence-Transformers · LangChain")
+
+# ── Tab layout ────────────────────────────────────────────────────────────────
+tab_overview, tab_suites, tab_compare, tab_trends, tab_detail, tab_export = st.tabs([
+    "📊 Overview", "🗂 Suite Breakdown", "📋 Multi-Run Compare",
+    "📈 Trends", "🔬 Test Detail", "⬇️ Export"
+])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 1 — OVERVIEW
+# ════════════════════════════════════════════════════════════════════════════
+with tab_overview:
+    total   = len(df)
+    passed  = (df["verdict"] == "PASS").sum()
+    failed  = total - passed
+    pass_rt = passed / total * 100 if total else 0
+
+    avg_score      = df["score"].dropna().mean()         if "score"              in df.columns else None
+    avg_relevance  = df["relevance_score"].dropna().mean() if "relevance_score"  in df.columns else None
+    avg_halluc     = df["hallucination_score"].dropna().mean() if "hallucination_score" in df.columns else None
+    halluc_rate    = ((df["hallucination_score"] < 80).sum() / total * 100) if ("hallucination_score" in df.columns and total > 0) else None
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Tests", total)
+    col2.metric("✅ Passed", passed, f"{pass_rt:.1f}%")
+    col3.metric("❌ Failed", failed, f"{100-pass_rt:.1f}%", delta_color="inverse")
+    col4.metric("Avg Judge Score", f"{avg_score:.1f}" if avg_score is not None else "—")
+    col5.metric("Avg Relevance", f"{avg_relevance:.3f}" if avg_relevance is not None else "—")
+
+    col6, col7 = st.columns(2)
+    col6.metric(
+        "Hallucination Rate",
+        f"{halluc_rate:.1f}%" if halluc_rate is not None else "—",
+        help="% tests where hallucination support < 80%",
+        delta_color="inverse"
+    )
+    if avg_halluc is not None:
+        col7.metric("Avg Hallucination Score", f"{avg_halluc:.1f}%", help="Higher = better (more claims supported)")
+
+    #st.markdown("---")
+    # Token usage summary
+    st.markdown("---")
+    st.subheader("🪙 Token Usage")
+
+# Replace the token query block with this safer version
+    try:
+        with _get_conn() as conn:
+            if selected_run_id:
+                token_df = pd.read_sql_query("""
+                    SELECT 
+                        lc.test_id,
+                        SUM(lc.tokens_input)  as input_tokens,
+                        SUM(lc.tokens_output) as output_tokens,
+                        SUM(lc.tokens_input + lc.tokens_output) as total_tokens
+                    FROM llm_calls lc
+                    JOIN test_results tr ON lc.test_id = tr.test_id
+                    WHERE tr.run_id = ?
+                    GROUP BY lc.test_id
+            """, conn, params=(selected_run_id,))
+            else:
+                token_df = pd.read_sql_query("""
+                    SELECT 
+                        lc.test_id,
+                        SUM(lc.tokens_input)  as input_tokens,
+                        SUM(lc.tokens_output) as output_tokens,
+                        SUM(lc.tokens_input + lc.tokens_output) as total_tokens
+                    FROM llm_calls lc
+                    GROUP BY lc.test_id
+                """, conn)
+                #""", conn, params=(selected_run_id,) if selected_run_id else ("__none__",))
+
+        if not token_df.empty:
+            total_in  = int(token_df["input_tokens"].sum())
+            total_out = int(token_df["output_tokens"].sum())
+            total_all = int(token_df["total_tokens"].sum())
+
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Prompt Tokens",     f"{total_in:,}")
+            t2.metric("Completion Tokens", f"{total_out:,}")
+            t3.metric("Total Tokens",      f"{total_all:,}")
+            
+            estimated_cost = (total_in * 0.05 / 1_000_000) + (total_out * 0.08 / 1_000_000)
+            st.caption(f"💰 Estimated Groq cost: **${estimated_cost:.6f}** (llama-3.1-8b rates)")
+
+            # Per-test bar chart
+            fig_tok = px.bar(
+                token_df, x="test_id",
+                y=["input_tokens", "output_tokens"],
+                title="Token Usage per Test",
+                labels={"value": "Tokens", "test_id": "Test", "variable": ""},
+                color_discrete_map={"input_tokens": "#89b4fa", "output_tokens": "#a6e3a1"},
+                barmode="stack"
+            )
+            fig_tok.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis_tickangle=-30
+            )
+            st.plotly_chart(fig_tok, use_container_width=True)
+        else:
+            st.info("No token data yet — re-run a suite after applying the groq_client fix.")
+    except Exception as e:
+        st.warning(f"Token data unavailable: {e}")
+
+    # Pass/fail pie
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_pie = px.pie(
+            values=[passed, failed],
+            names=["PASS", "FAIL"],
+            color_discrete_sequence=["#a6e3a1", "#f38ba8"],
+            title="Overall Pass / Fail"
+        )
+        fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with c2:
+        if "suite_name" in df.columns:
+            suite_grp = df.groupby("suite_name").agg(
+                total=("verdict", "count"),
+                passed=("verdict", lambda x: (x == "PASS").sum())
+            ).reset_index()
+
+            # ✅ FORCE NUMERIC (fix for Arrow/string dtype issue)
+            suite_grp["total"] = pd.to_numeric(suite_grp["total"], errors="coerce")
+            suite_grp["passed"] = pd.to_numeric(suite_grp["passed"], errors="coerce")
+
+            # ✅ SAFE CALCULATIONS
+            suite_grp["failed"] = suite_grp["total"] - suite_grp["passed"]
+            suite_grp["pass_rate"] = (
+                suite_grp["passed"] / suite_grp["total"] * 100
+            )
+
+            fig_bar = px.bar(
+                suite_grp, x="suite_name", y=["passed", "failed"],
+                title="Pass/Fail by Suite",
+                labels={"suite_name": "Suite", "value": "Count", "variable": ""},
+                color_discrete_map={"passed": "#a6e3a1", "failed": "#f38ba8"},
+                barmode="stack"
+            )
+            fig_bar.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+    # Regression alerts
+    if "regressed" in df.columns:
+        regressions = df[df["regressed"] == 1]
+        if not regressions.empty:
+            with st.expander(f"⚠️ Regression Alerts ({len(regressions)})", expanded=True):
+                for _, row in regressions.iterrows():
+                    st.error(
+                        f"**{row['test_id']}** — score dropped "
+                        f"{row.get('score_drop', '?')} pts on "
+                        f"{str(row.get('timestamp',''))[:19]}"
+                    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SUITE BREAKDOWN
+# ════════════════════════════════════════════════════════════════════════════
+with tab_suites:
+    st.subheader("🗂 Results by Test Suite")
+
+    if "suite_name" not in df.columns or df["suite_name"].isna().all():
+        st.warning("No suite_name data available — make sure runs are recorded with suite metadata.")
+    else:
+        suites_available = sorted(df["suite_name"].dropna().unique().tolist())
+
+        if not suites_available:
+            st.info("No suites found in filtered data.")
+        else:
+            suite_tabs = st.tabs([s.upper() for s in suites_available])
+
+            for suite_tab, suite_name in zip(suite_tabs, suites_available):
+                with suite_tab:
+                    s_df = df[df["suite_name"] == suite_name].copy()
+                    s_total  = len(s_df)
+                    s_passed = (s_df["verdict"] == "PASS").sum()
+                    s_failed = s_total - s_passed
+
+                    s_avg_score   = s_df["score"].dropna().mean()           if "score"              in s_df.columns else None
+                    s_avg_rel     = s_df["relevance_score"].dropna().mean() if "relevance_score"    in s_df.columns else None
+                    s_avg_hal     = s_df["hallucination_score"].dropna().mean() if "hallucination_score" in s_df.columns else None
+
+                    # Suite metric row
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Tests", s_total)
+                    m2.metric("✅ Passed", s_passed, f"{s_passed/s_total*100:.0f}%" if s_total else "—")
+                    m3.metric("❌ Failed", s_failed)
+                    m4.metric("Avg Judge Score", f"{s_avg_score:.1f}" if s_avg_score is not None else "—")
+                    m5.metric("Avg Relevance",   f"{s_avg_rel:.3f}"   if s_avg_rel   is not None else "—")
+
+                    if s_avg_hal is not None:
+                        st.metric("Avg Hallucination Score", f"{s_avg_hal:.1f}%",
+                                  help="% of claims supported (higher = less hallucination)")
+
+                    st.markdown("---")
+
+                    # Per-test table for this suite
+                    disp_cols = [c for c in ["test_id","verdict","score","relevance_score",
+                                              "hallucination_score","latency_ms","reason"]
+                                 if c in s_df.columns]
+                    styled = s_df[disp_cols].copy()
+                    # Convert numeric score cols to string BEFORE styling
+                    # so Streamlit doesn't silently coerce "N/A" back to NaN
+                    for col in ["score", "relevance_score", "hallucination_score"]:
+                        if col in styled.columns:
+                            styled[col] = styled[col].apply(
+                                lambda x: f"{x:.1f}" if pd.notna(x) else "N/A"
+                            ).astype(str)
+                    # Rename for clarity
+                    styled = styled.rename(columns={
+                        "relevance_score":    "relevance",
+                        "hallucination_score":"hallucination",
+                    })
+                    disp_cols = list(styled.columns)
+
+                    def _color_row(row):
+                        if row.get("verdict") == "PASS":
+                            return ["color: #a6e3a1" if c == "verdict" else "" for c in disp_cols]
+                        elif row.get("verdict") == "FAIL":
+                            return ["color: #f38ba8" if c == "verdict" else "" for c in disp_cols]
+                        return ["" for _ in disp_cols]
+
+                    st.dataframe(
+                        styled.style.apply(_color_row, axis=1),
+                        use_container_width=True,
+                        height=min(400, 60 + len(styled) * 38)
+                    )
+
+                    # Distribution charts for this suite
+                    if s_total >= 2:
+                        hc1, hc2 = st.columns(2)
+
+                        with hc1:
+                            rel_data = s_df["relevance_score"].dropna() if "relevance_score" in s_df.columns else pd.Series()
+                            if not rel_data.empty:
+                                fig = px.histogram(
+                                    rel_data,
+                                    nbins=15,
+                                    title="Relevance Distribution",
+                                    color_discrete_sequence=[suite_color(suite_name)]
+                                )
+                                fig.update_layout(
+                                    paper_bgcolor="rgba(0,0,0,0)",
+                                    plot_bgcolor="rgba(0,0,0,0)",
+                                    showlegend=False
+                                )
+                                st.plotly_chart(fig, use_container_width=True, key=f"rel_dist_{suite_name}")
+
+                        with hc2:
+                            hal_data = s_df["hallucination_score"].dropna() if "hallucination_score" in s_df.columns else pd.Series()
+                            if not hal_data.empty:
+                                fig = px.histogram(
+                                    hal_data,
+                                    nbins=15,
+                                    title="Hallucination Score Distribution",
+                                    color_discrete_sequence=["#fab387"]
+                                )
+                                fig.update_layout(
+                                    paper_bgcolor="rgba(0,0,0,0)",
+                                    plot_bgcolor="rgba(0,0,0,0)",
+                                    showlegend=False
+                                )
+                                st.plotly_chart(fig, use_container_width=True, key=f"hal_dist_{suite_name}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — MULTI-RUN COMPARISON
+# ════════════════════════════════════════════════════════════════════════════
+with tab_compare:
+    st.subheader("📋 Multi-Run Comparison")
+
+    if runs_df.empty:
+        st.info("No runs in database yet.")
+    else:
+        # Build comparison table
+        rows = []
+        for _, run in runs_df.head(20).iterrows():
+            rid = run["run_id"]
+            run_results = all_df[all_df["run_id"] == rid]
+            total_r  = len(run_results)
+            passed_r = (run_results["verdict"] == "PASS").sum() if not run_results.empty else 0
+            avg_s    = run_results["score"].dropna().mean()           if "score"              in run_results.columns else None
+            avg_rel  = run_results["relevance_score"].dropna().mean() if "relevance_score"    in run_results.columns else None
+            avg_hal  = run_results["hallucination_score"].dropna().mean() if "hallucination_score" in run_results.columns else None
+
+            rows.append({
+                "Run ID": rid[:30] + "..." if len(rid) > 30 else rid,
+                "Suite": run.get("suite_name", "—"),
+                "Start Time": str(run.get("start_time", ""))[:19],
+                "Total": total_r,
+                "Passed": passed_r,
+                "Failed": total_r - passed_r,
+                "Pass Rate": f"{passed_r/total_r*100:.0f}%" if total_r else "—",
+                "Avg Score": f"{avg_s:.1f}" if avg_s is not None else "—",
+                "Avg Relevance": f"{avg_rel:.3f}" if avg_rel is not None else "—",
+                "Avg Halluc %": f"{avg_hal:.1f}" if avg_hal is not None else "—",
+            })
+
+        compare_df = pd.DataFrame(rows)
+
+        def _color_pass_rate(val):
+            try:
+                num = float(val.replace("%", ""))
+                if num >= 80:
+                    return "color: #a6e3a1"
+                elif num >= 50:
+                    return "color: #f9e2af"
+                else:
+                    return "color: #f38ba8"
+            except Exception:
+                return ""
+
+        styled_compare = compare_df.style.map(_color_pass_rate, subset=["Pass Rate"])
+        st.dataframe(styled_compare, use_container_width=True, height=400)
+
+        # Suite-level trend across runs
+        if "suite_name" in all_df.columns:
+            st.markdown("---")
+            st.markdown("**Pass Rate Trend by Suite**")
+
+            trend_rows = []
+            for _, run in runs_df.iterrows():
+                rid = run["run_id"]
+                suite = run.get("suite_name", "unknown")
+                run_res = all_df[all_df["run_id"] == rid]
+                total_r = len(run_res)
+                if total_r == 0:
+                    continue
+                passed_r = (run_res["verdict"] == "PASS").sum()
+                trend_rows.append({
+                    "start_time": str(run.get("start_time", ""))[:19],
+                    "suite": suite,
+                    "pass_rate": passed_r / total_r * 100
+                })
+
+            if trend_rows:
+                trend_df = pd.DataFrame(trend_rows)
+                fig = px.line(
+                    trend_df, x="start_time", y="pass_rate", color="suite",
+                    markers=True, title="Pass Rate Over Time by Suite",
+                    labels={"start_time": "Run Time", "pass_rate": "Pass Rate (%)", "suite": "Suite"},
+                    color_discrete_map={k: v for k, v in SUITE_COLORS.items()}
+                )
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4 — TRENDS
+# ════════════════════════════════════════════════════════════════════════════
+with tab_trends:
+    st.subheader("📈 Score Trends Over Time")
+
+    if "timestamp" not in df.columns or df.empty:
+        st.info("No trend data available.")
+    else:
+        df_t = df.copy()
+        df_t["timestamp_dt"] = pd.to_datetime(df_t["timestamp"])
+
+        # Pass/fail bar
+        trend_grp = (
+            df_t.groupby([df_t["timestamp_dt"].dt.floor("h"), "verdict"])
+            .size().reset_index(name="count")
+        )
+        trend_grp.columns = ["timestamp", "verdict", "count"]
+        fig_bar = px.bar(
+            trend_grp, x="timestamp", y="count", color="verdict",
+            color_discrete_map={"PASS": "#a6e3a1", "FAIL": "#f38ba8"},
+            barmode="group", title="Pass / Fail Over Time"
+        )
+        fig_bar.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+        # Score traces
+        metric_cols = [c for c in ["score", "relevance_score", "hallucination_score"] if c in df_t.columns]
+        # Note: df_t keeps numeric NaN here — charts need numeric values, dropna handles the gaps
+        if metric_cols:
+            fig_m = go.Figure()
+            for col in metric_cols:
+                m_df = df_t.dropna(subset=[col]).sort_values("timestamp_dt")
+                fig_m.add_trace(go.Scatter(
+                    x=m_df["timestamp_dt"], y=m_df[col],
+                    mode="lines+markers",
+                    name=col.replace("_", " ").title(),
+                    line=dict(width=2)
+                ))
+            fig_m.update_layout(
+                title="Metric Scores Over Time",
+                xaxis_title="Timestamp", yaxis_title="Score",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+
+        # Latency trend
+        if "latency_ms" in df_t.columns:
+            lat_df = df_t.dropna(subset=["latency_ms"]).sort_values("timestamp_dt")
+            if not lat_df.empty:
+                fig_lat = px.scatter(
+                    lat_df, x="timestamp_dt", y="latency_ms",
+                    color="verdict" if "verdict" in lat_df.columns else None,
+                    color_discrete_map={"PASS": "#a6e3a1", "FAIL": "#f38ba8"},
+                    title="LLM Latency per Test (ms)",
+                    labels={"timestamp_dt": "Time", "latency_ms": "Latency (ms)"}
+                )
+                fig_lat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig_lat, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5 — TEST DETAIL
+# ════════════════════════════════════════════════════════════════════════════
+with tab_detail:
+    st.subheader("🔬 Test Detail Viewer")
+
+    if df.empty:
+        st.info("No tests in current filter.")
+    else:
+        # Suite filter within detail tab
+        suite_choices = ["All Suites"]
+        if "suite_name" in df.columns:
+            suite_choices += sorted(df["suite_name"].dropna().unique().tolist())
+        suite_sel = st.selectbox("Filter by suite", suite_choices, key="detail_suite")
+
+        detail_df = df if suite_sel == "All Suites" else df[df["suite_name"] == suite_sel]
+
+        test_ids = sorted(detail_df["test_id"].unique().tolist())
+        if not test_ids:
+            st.info("No tests match.")
+        else:
+            selected_test = st.selectbox("Select Test Case", test_ids)
+            row = detail_df[detail_df["test_id"] == selected_test].iloc[0]
+
+            verdict = row.get("verdict", "?")
+            icon = "✅" if verdict == "PASS" else "❌"
+            st.markdown(f"### {icon} `{selected_test}` — **{verdict}**")
+
+            # Metrics row
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            def _fmt(val, decimals=1, suffix="", na_label="N/A"):
+                """Format a metric value — returns na_label if None, NaN, or missing."""
+                if val is None:
+                    return na_label
+                try:
+                    import math
+                    if math.isnan(float(val)):
+                        return na_label
+                except (TypeError, ValueError):
+                    pass
+                return f"{round(float(val), decimals)}{suffix}"
+
+            mc1.metric("Judge Score",     _fmt(row.get("score"),              na_label="N/A (no judge)"))
+            mc2.metric("Relevance",       _fmt(row.get("relevance_score"),    na_label="N/A (judge_only)"))
+            mc3.metric("Hallucination %", _fmt(row.get("hallucination_score"),na_label="N/A (judge_only)"))
+            mc4.metric("Latency",         _fmt(row.get("latency_ms"), decimals=0, suffix=" ms", na_label="N/A"))
+
+            st.markdown("---")
+
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.markdown("**🧾 Judge Reasoning**")
+                reason = row.get("reason", "")
+                if reason:
+                    # Split combined Groq|Gemini reason
+                    if " | " in str(reason):
+                        parts = str(reason).split(" | ")
+                        for part in parts:
+                            if part.strip():
+                                st.info(part.strip())
+                    else:
+                        st.info(str(reason))
+                else:
+                    st.caption("No reasoning available.")
+
+                st.markdown("**ℹ️ Run Info**")
+                st.json({
+                    "Test ID": row.get("test_id", ""),
+                    "Suite": row.get("suite_name", "—"),
+                    "Run ID": row.get("run_id", "—"),
+                    "Timestamp": str(row.get("timestamp", ""))[:19],
+                })
+
+            with col_right:
+                metadata = load_heuristic_details(row["test_id"], row.get("run_id", ""))
+
+                if metadata:
+                    st.markdown("**📥 Input Prompt**")
+                    input_text = metadata.get("input") or metadata.get("input_data", "N/A")
+                    st.code(str(input_text)[:500], language="text")
+
+                    exp_out = metadata.get("expected_output", "")
+                    act_out = metadata.get("actual_output", "")
+
+                    if exp_out:
+                        st.markdown("**🎯 Expected Behavior**")
+                        st.code(str(exp_out)[:400], language="text")
+
+                    if act_out:
+                        st.markdown("**🤖 Actual Response**")
+                        st.code(str(act_out)[:500], language="text")
+
+                    # Heuristic assertion breakdown
+                    heuristic_results = metadata.get("heuristic_results", [])
+                    if heuristic_results:
+                        st.markdown("**🔧 Heuristic Assertions**")
+                        for h in heuristic_results:
+                            icon_h = "✅" if h.get("passed") else "❌"
+                            atype  = h.get("type", "?")
+                            aval   = h.get("value", "")
+                            st.markdown(f"{icon_h} `{atype}` — `{aval}`")
+                else:
+                    st.caption("No metadata stored for this test.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 6 — EXPORT
+# ════════════════════════════════════════════════════════════════════════════
+with tab_export:
+    st.subheader("⬇️ Export Results")
+
+    export_cols = [c for c in [
+        "timestamp", "suite_name", "run_id", "test_id", "verdict",
+        "score", "relevance_score", "hallucination_score", "latency_ms", "reason"
+    ] if c in df.columns]
+
+    export_df = df[export_cols].copy()
+    for col in ["score", "relevance_score", "hallucination_score"]:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) else "N/A"
+            ).astype(str)
+
+    st.dataframe(export_df, use_container_width=True, height=350)
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        csv_data = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download CSV",
+            data=csv_data,
+            file_name=f"verdictai_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+    with col_b:
+        json_data = export_df.to_json(orient="records", indent=2).encode("utf-8")
+        st.download_button(
+            "📥 Download JSON",
+            data=json_data,
+            file_name=f"verdictai_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json"
+        )
+
+    # Per-suite CSV
+    if "suite_name" in df.columns:
+        st.markdown("**Export by Suite**")
+        for suite_name in sorted(df["suite_name"].dropna().unique()):
+            suite_csv = df[df["suite_name"] == suite_name][export_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"📥 {suite_name.upper()} — CSV",
+                data=suite_csv,
+                file_name=f"verdictai_{suite_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key=f"export_{suite_name}"
+            )
+
