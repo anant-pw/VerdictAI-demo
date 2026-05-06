@@ -1023,7 +1023,7 @@ with tab_run:
         from runner.assertions import run_assertions as _run_assertions
         from runner.groq_model import get_response as _get_response
         from runner.retry_utils import inter_case_sleep as _sleep
-        from judge.multi_judge import multi_judge_response as _multi_judge
+        # multi_judge imported lazily below to pick up live API key
         from judge.relevance_scorer import get_relevance_score as _relevance
         from judge.hallucination_detector import detect_hallucination as _hallucination
         from memory.store import init_db as _init_db, save_result as _save_result
@@ -1071,7 +1071,23 @@ with tab_run:
 
                 _judge_r = _rel = _hall = None
                 if _heur_pass and use_judge_ui and _exp:
-                    _judge_r = _multi_judge(_inp, _resp, _exp, _thresh)
+                    # Build fresh judge with live key (avoids stale key from module import time)
+                import importlib, judge.multi_judge as _mj_mod
+                import langchain_groq, os as _os2
+                from langchain_core.prompts import ChatPromptTemplate
+                from langchain_core.output_parsers import StrOutputParser
+                _live_key = _os2.environ.get("GROQ_API_KEY", "")
+                _live_groq = (
+                    _mj_mod.JUDGE_PROMPT
+                    | langchain_groq.ChatGroq(
+                        model=_os2.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                        temperature=0.0,
+                        api_key=_live_key,
+                    )
+                    | StrOutputParser()
+                )
+                _mj_mod._groq_chain = _live_groq  # patch the module-level chain
+                _judge_r = _mj_mod.multi_judge_response(_inp, _resp, _exp, _thresh)
                     if _mode == "full":
                         _rel = _relevance(_resp, _exp)
                         _src = _case.get("source_context", _exp)
@@ -1141,3 +1157,8 @@ with tab_run:
         st.success(f"Run complete! Run ID: `{run_id_ui}`")
         st.cache_data.clear()
         st.info("Switch to the Overview tab to see results.")
+
+# Force Streamlit to reload all cached data on next render
+import time as _rerun_time
+_rerun_time.sleep(0.5)
+st.rerun()
