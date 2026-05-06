@@ -67,6 +67,17 @@ st.markdown("""
 def _get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Ensure llm_calls exists even on pre-existing DBs
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_calls (
+            call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id TEXT NOT NULL, model TEXT NOT NULL,
+            prompt TEXT, response TEXT, latency_ms REAL,
+            cost_usd REAL DEFAULT 0.0, tokens_input INTEGER,
+            tokens_output INTEGER, timestamp TEXT
+        )
+    """)
+    conn.commit()
     return conn
 
 
@@ -175,6 +186,15 @@ def _seed_demo_db():
                 score_drop REAL, UNIQUE(run_id, test_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS llm_calls (
+                call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_id TEXT NOT NULL, model TEXT NOT NULL,
+                prompt TEXT, response TEXT, latency_ms REAL,
+                cost_usd REAL DEFAULT 0.0, tokens_input INTEGER,
+                tokens_output INTEGER, timestamp TEXT
+            )
+        """)
         conn.commit()
 
         base_time = datetime.utcnow() - timedelta(hours=3)
@@ -217,6 +237,19 @@ def _seed_demo_db():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (run_id, f"{run_id}::{test_id}", verdict, score, relevance,
                       hallucination, demo_reasons[verdict], ts, latency, metadata))
+
+                # Seed llm_calls so token usage section renders
+                tokens_in  = random.randint(180, 600)
+                tokens_out = random.randint(80, 300)
+                for model in ["groq/llama-3.1-8b-instant", "groq/llama-3.1-8b-instant"]:
+                    conn.execute("""
+                        INSERT INTO llm_calls
+                        (test_id, model, prompt, response, latency_ms, tokens_input, tokens_output, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (f"{run_id}::{test_id}", model,
+                          f"Demo prompt for {test_id}",
+                          f"Demo response for {test_id}",
+                          latency, tokens_in, tokens_out, ts))
 
                 if verdict == "PASS": passed += 1
                 else: failed += 1
