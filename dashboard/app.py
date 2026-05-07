@@ -995,10 +995,17 @@ with tab_run:
         st.caption("⚠️ Enter a Groq API key to enable the run button.")
 
     if run_btn and selected_suite_path and groq_key_input:
-        # Inject keys into environment for this process
+        # Inject keys into environment BEFORE any module uses them
         _os.environ["GROQ_API_KEY"] = groq_key_input
         if samba_key_input:
             _os.environ["SAMBANOVA_API_KEY"] = samba_key_input
+
+        # Reset cached Groq client so it rebuilds with the new key
+        try:
+            import judge.groq_client as _gc
+            _gc._client = None  # force lazy reinit with live key
+        except Exception:
+            pass
 
         st.markdown("---")
         st.markdown("#### 🔄 Live Output")
