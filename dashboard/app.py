@@ -1055,83 +1055,117 @@ with tab_run:
             progress_bar.progress((_i) / _total, text=f"Test {_i+1}/{_total}")
 
             try:
-                _t0 = _time.time()
-                _resp, _tokens = _get_response(_inp)
-                _lat = int((_time.time() - _t0) * 1000)
+                # ── Step log expander per test ────────────────────────────
+                with results_log.expander(f"🔍 {_case.get('id','?')} — running...", expanded=True) as _exp_box:
+                    _step = st.empty()
 
-                db_ui.save_llm_call(
-                    test_id=_tid, model=_os.getenv("GROQ_MODEL", "groq/llama3-8b"),
-                    prompt=_inp, response=_resp, latency_ms=_lat,
-                    tokens_input=_tokens["tokens_input"],
-                    tokens_output=_tokens["tokens_output"]
-                )
+                    _step.info("⏳ Getting model response...")
+                    _t0 = _time.time()
+                    _resp, _tokens = _get_response(_inp)
+                    _lat = int((_time.time() - _t0) * 1000)
+                    _step.info(f"✅ Response received in {_lat}ms")
+                    st.code(_resp[:300], language=None)
 
-                _heur = _run_assertions(_resp, _case.get("assertions", []))
-                _heur_pass = all(h["passed"] for h in _heur)
-
-                _judge_r = _rel = _hall = None
-                if _heur_pass and use_judge_ui and _exp:
-                    # Build fresh judge with live key (avoids stale key from module import time)
-                    import judge.multi_judge as _mj_mod
-                    import langchain_groq, os as _os2
-                    from langchain_core.output_parsers import StrOutputParser
-                    _live_key = _os2.environ.get("GROQ_API_KEY", "")
-                    _live_groq = (
-                        _mj_mod.JUDGE_PROMPT
-                        | langchain_groq.ChatGroq(
-                            model=_os2.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-                            temperature=0.0,
-                            api_key=_live_key,
-                        )
-                        | StrOutputParser()
+                    db_ui.save_llm_call(
+                        test_id=_tid, model=_os.getenv("GROQ_MODEL", "groq/llama3-8b"),
+                        prompt=_inp, response=_resp, latency_ms=_lat,
+                        tokens_input=_tokens["tokens_input"],
+                        tokens_output=_tokens["tokens_output"]
                     )
-                    _mj_mod._groq_chain = _live_groq  # patch with live key
-                    _judge_r = _mj_mod.multi_judge_response(_inp, _resp, _exp, _thresh)
-                    if _mode == "full":
-                        _rel = _relevance(_resp, _exp)
-                        _src = _case.get("source_context", _exp)
-                        _hall = _hallucination(_resp, _src)
 
-                _verdict = _compute_verdict(_heur_pass, _heur, _judge_r, _rel, _hall, _mode)
-                _vlabel = _verdict.get("verdict") if isinstance(_verdict, dict) else _verdict
+                    _step.info("⏳ Running heuristic assertions...")
+                    _heur = _run_assertions(_resp, _case.get("assertions", []))
+                    _heur_pass = all(h["passed"] for h in _heur)
+                    for _h in _heur:
+                        _hicon = "✅" if _h["passed"] else "❌"
+                        st.write(f"{_hicon} Heuristic `{_h.get('type','?')}`: {_h.get('value','')}")
 
-                db_ui.save_test_case(test_id=_tid, run_id=run_id_ui,
-                    test_name=_tid, input_data=_inp, expected_output=_exp,
-                    actual_output=_resp, passed=(_vlabel == "PASS"))
-                db_ui.save_test_result(
-                    run_id=run_id_ui, test_id=_tid, verdict=_vlabel,
-                    score=_judge_r.get("score") if _judge_r else None,
-                    relevance_score=_rel.get("score") if _rel else None,
-                    hallucination_score=_hall.get("score") if _hall else None,
-                    reason=_verdict.get("reason") if isinstance(_verdict, dict) else None,
-                    latency_ms=_lat
-                )
+                    _judge_r = _rel = _hall = None
+                    if not _heur_pass:
+                        _step.error("❌ Heuristics failed — skipping judge")
+                    elif not use_judge_ui or not _exp:
+                        _step.warning("⚠️ Judge skipped (disabled or no expected_behavior)")
+                    else:
+                        _step.info("⏳ Running LLM judge...")
+                        try:
+                            import judge.multi_judge as _mj_mod
+                            import langchain_groq as _lgroq, os as _os2
+                            from langchain_core.output_parsers import StrOutputParser
+                            _live_key = _os2.environ.get("GROQ_API_KEY", "")
+                            _live_groq = (
+                                _mj_mod.JUDGE_PROMPT
+                                | _lgroq.ChatGroq(
+                                    model=_os2.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                                    temperature=0.0,
+                                    api_key=_live_key,
+                                )
+                                | StrOutputParser()
+                            )
+                            _mj_mod._groq_chain = _live_groq
+                            _judge_r = _mj_mod.multi_judge_response(_inp, _resp, _exp, _thresh)
+                            st.write(f"🧑‍⚖️ Judge score: `{_judge_r.get('score')}` | verdict: `{_judge_r.get('verdict')}` | reason: {_judge_r.get('reason','')}")
+                        except Exception as _je:
+                            st.error(f"💥 Judge error: {_je}")
+                            import traceback; st.code(traceback.format_exc())
 
-                if _judge_r:
-                    db_ui.save_score(_tid, "judge_score", _judge_r["score"], _judge_r.get("reason"))
-                if _rel:
-                    db_ui.save_score(_tid, "relevance_score", _rel["score"])
-                if _hall:
-                    db_ui.save_score(_tid, "hallucination_score", _hall["score"])
+                        if _mode == "full" and _judge_r:
+                            try:
+                                _step.info("⏳ Scoring relevance...")
+                                _rel = _relevance(_resp, _exp)
+                                st.write(f"📐 Relevance: `{_rel.get('score')}` (cosine={_rel.get('cosine_similarity')})")
+                            except Exception as _re:
+                                st.warning(f"Relevance error: {_re}")
+                            try:
+                                _step.info("⏳ Detecting hallucination...")
+                                _src = _case.get("source_context", _exp)
+                                _hall = _hallucination(_resp, _src)
+                                st.write(f"🔮 Hallucination support: `{_hall.get('score')}%` ({_hall.get('claims_supported')}/{_hall.get('claims_total')} claims)")
+                            except Exception as _he:
+                                st.warning(f"Hallucination error: {_he}")
 
-                _save_result(suite_name_ui, {
-                    "id": _tid, "verdict": _verdict,
-                    "judge": _judge_r, "response": _resp, "latency_ms": _lat
-                })
+                    _verdict = _compute_verdict(_heur_pass, _heur, _judge_r, _rel, _hall, _mode)
+                    _vlabel = _verdict.get("verdict") if isinstance(_verdict, dict) else _verdict
+                    _step.empty()
 
-                if _vlabel == "PASS":
-                    passed_ui += 1
-                    results_log.success(f"✅ **{_case.get('id','?')}** — PASS | score={_judge_r.get('score','—') if _judge_r else '—'} | {_lat}ms")
-                else:
-                    failed_ui += 1
-                    _why = _verdict.get("reason","") if isinstance(_verdict, dict) else ""
-                    results_log.error(f"❌ **{_case.get('id','?')}** — FAIL | {_why}")
+                    db_ui.save_test_case(test_id=_tid, run_id=run_id_ui,
+                        test_name=_tid, input_data=_inp, expected_output=_exp,
+                        actual_output=_resp, passed=(_vlabel == "PASS"))
+                    db_ui.save_test_result(
+                        run_id=run_id_ui, test_id=_tid, verdict=_vlabel,
+                        score=_judge_r.get("score") if _judge_r else None,
+                        relevance_score=_rel.get("score") if _rel else None,
+                        hallucination_score=_hall.get("score") if _hall else None,
+                        reason=_verdict.get("reason") if isinstance(_verdict, dict) else None,
+                        latency_ms=_lat
+                    )
+                    if _judge_r:
+                        db_ui.save_score(_tid, "judge_score", _judge_r["score"], _judge_r.get("reason"))
+                    if _rel:
+                        db_ui.save_score(_tid, "relevance_score", _rel["score"])
+                    if _hall:
+                        db_ui.save_score(_tid, "hallucination_score", _hall["score"])
+
+                    _save_result(suite_name_ui, {
+                        "id": _tid, "verdict": _verdict,
+                        "judge": _judge_r, "response": _resp, "latency_ms": _lat
+                    })
+
+                    if _vlabel == "PASS":
+                        passed_ui += 1
+                        st.success(f"✅ PASS | score={_judge_r.get('score','—') if _judge_r else '—'} | {_lat}ms")
+                    else:
+                        failed_ui += 1
+                        _why = _verdict.get("reason","") if isinstance(_verdict, dict) else "unknown"
+                        st.error(f"❌ FAIL — {_why}")
 
                 results_ui.append({"id": _tid, "verdict": _verdict, "judge": _judge_r})
 
             except Exception as _ex:
+                import traceback as _tb
                 failed_ui += 1
-                results_log.error(f"💥 **{_case.get('id','?')}** — ERROR: {_ex}")
+                with results_log.expander(f"💥 {_case.get('id','?')} — EXCEPTION", expanded=True):
+                    st.error(str(_ex))
+                    st.code(_tb.format_exc())
 
             if _i < _total - 1:
                 _sleep(2.0)
@@ -1153,11 +1187,9 @@ with tab_run:
         c2.metric("✅ Passed", passed_ui, f"{_pct:.1f}%")
         c3.metric("❌ Failed", failed_ui, delta_color="inverse")
 
-        st.success(f"Run complete! Run ID: `{run_id_ui}`")
+        st.success(f"✅ Run complete! Run ID: `{run_id_ui}`")
         st.cache_data.clear()
-        st.info("Switch to the Overview tab to see results.")
-
-# Force Streamlit to reload all cached data on next render
-import time as _rerun_time
-_rerun_time.sleep(0.5)
-st.rerun()
+        st.session_state["active_tab"] = "overview"
+        st.info("🔄 Refreshing dashboard...")
+        import time as _rerun_time; _rerun_time.sleep(1)
+        st.rerun()
