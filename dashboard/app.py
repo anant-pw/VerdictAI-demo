@@ -1089,20 +1089,36 @@ with tab_run:
                         _step.info("⏳ Running LLM judge...")
                         try:
                             import judge.multi_judge as _mj_mod
-                            import langchain_groq as _lgroq, os as _os2
+                            import langchain_groq as _lgroq, os as _os2, json as _json
                             from langchain_core.output_parsers import StrOutputParser
+                            from judge.llm_judge import _parse_judge_output
                             _live_key = _os2.environ.get("GROQ_API_KEY", "")
-                            _live_groq = (
+                            _live_model = _os2.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+                            # Build a fresh chain with the live key — bypasses stale module-level chain
+                            _fresh_chain = (
                                 _mj_mod.JUDGE_PROMPT
-                                | _lgroq.ChatGroq(
-                                    model=_os2.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-                                    temperature=0.0,
-                                    api_key=_live_key,
-                                )
+                                | _lgroq.ChatGroq(model=_live_model, temperature=0.0, api_key=_live_key)
                                 | StrOutputParser()
                             )
-                            _mj_mod._groq_chain = _live_groq
-                            _judge_r = _mj_mod.multi_judge_response(_inp, _resp, _exp, _thresh)
+                            _raw = _fresh_chain.invoke({
+                                "input": _inp,
+                                "response": _resp,
+                                "expected_behavior": _exp,
+                                "threshold": _thresh,
+                            })
+                            st.write(f"🔎 Raw judge output: `{_raw[:200]}`")
+                            _parsed = _parse_judge_output(_raw)
+                            _judge_r = {
+                                "score":   _parsed.get("score", 0),
+                                "verdict": _parsed.get("verdict", "FAIL"),
+                                "reason":  _parsed.get("reason", ""),
+                                "groq":    _parsed,
+                                "gemini":  {"score": 0, "verdict": "FAIL", "reason": "No second judge in UI mode"},
+                                "disagreement": False,
+                                "judges_used": 1,
+                                "raw": _raw,
+                            }
                             st.write(f"🧑‍⚖️ Judge score: `{_judge_r.get('score')}` | verdict: `{_judge_r.get('verdict')}` | reason: {_judge_r.get('reason','')}")
                         except Exception as _je:
                             st.error(f"💥 Judge error: {_je}")
@@ -1189,7 +1205,5 @@ with tab_run:
 
         st.success(f"✅ Run complete! Run ID: `{run_id_ui}`")
         st.cache_data.clear()
-        st.session_state["active_tab"] = "overview"
-        st.info("🔄 Refreshing dashboard...")
-        import time as _rerun_time; _rerun_time.sleep(1)
-        st.rerun()
+        if st.button("🔄 Go to Overview (click to refresh dashboard)"):
+            st.rerun()
